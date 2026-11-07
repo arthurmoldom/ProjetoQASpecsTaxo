@@ -1,0 +1,200 @@
+import pandas as pd
+import json
+# from google.cloud import bigquery
+from storage.controle_csv import (
+    append_registros
+)
+
+
+from config import *
+
+from auth.auth import get_credentials
+
+from sheets.metadata import (
+    obter_metadata_planilha
+)
+
+from sheets.leitura import (
+    abrir_planilha,
+    listar_abas,
+    obter_cabecalho,
+    ler_aba
+)
+
+from sheets.comparador import (
+    avaliar_status
+)
+
+from utils.hash_utils import (
+    hash_colunas,
+    hash_dataframe
+)
+
+from export.export_csv import (
+    exportar_csv
+)
+
+from bq.controle import (
+    obter_ultimo_registro
+)
+
+
+
+
+def main():
+
+    #creds = get_credentials(
+#        SERVICE_ACCOUNT_FILE
+#    )
+    creds = get_credentials()
+
+    metadata = obter_metadata_planilha(
+        SPREADSHEET_ID,
+        creds
+    )
+
+    planilha = abrir_planilha(
+        SPREADSHEET_ID,
+        creds
+    )
+
+ #   client = bigquery.Client(
+ #       project=PROJECT_ID,
+ #       credentials=creds
+ #   )
+
+
+   
+
+    registros_controle = []
+
+    for worksheet in planilha.worksheets():
+
+        print(f"Aba:{worksheet.title}, gid:{worksheet.id} ")
+
+        gid = str(worksheet.id)
+
+        nome = worksheet.title
+
+        cabecalho = obter_cabecalho(
+            worksheet
+        )
+        df = ler_aba(
+            worksheet
+        )
+#        dados = ler_aba(
+#            worksheet
+#        )
+
+#        df = pd.DataFrame(
+#            dados
+#        )
+
+        h_colunas = hash_colunas(
+            cabecalho
+        )
+
+        h_conteudo = hash_dataframe(
+            df
+        )
+
+#        ultimo = obter_ultimo_registro(
+#            client=client,
+#            project=PROJECT_ID,
+#            dataset=DATASET,
+#            tabela=TB_CONTROLE,
+#            gid=gid
+#        )
+
+        ultimo = obter_ultimo_registro(
+        gid=gid,
+        arquivo_controle=ARQ_CONTROLE
+        )
+
+        status, detalhe = avaliar_status(
+            {
+                "gid": gid,
+                "nome": nome,
+                "colunas": cabecalho
+            },
+            ultimo,
+            COLUNAS_ESPERADAS,
+            h_colunas,
+            h_conteudo
+        )
+
+        if status != "OK":
+
+            exportar_csv(
+                df=df,
+                pasta=CSV_FOLDER,
+                gid=gid,
+                nome_aba=nome
+            )
+
+        registro_execucao = [{
+        "dt_execucao":
+            pd.Timestamp.now(),
+
+        "spreadsheet_id":
+            metadata["spreadsheet_id"],
+
+        "spreadsheet_nome":
+            metadata["nome"],
+
+        "ultima_modificacao":
+            metadata["modified_time"],
+
+        "qtd_abas":
+            len(planilha.worksheets()),
+
+        "status_execucao":
+            "PROCESSADO",
+
+        "observacao":
+            ""
+        }]
+        registros_controle.append(
+            {
+                "spreadsheet_id":
+                    metadata["spreadsheet_id"],
+                "spreadsheet_nome":
+                    metadata["nome"],
+                "gid":
+                    gid,
+                "aba_nome":
+                    nome,
+                "ultima_modificacao":
+                    metadata["modified_time"],
+                "qtd_colunas":
+                    len(cabecalho),
+                "qtd_linhas":
+                    len(df),
+                "hash_colunas":
+                    h_colunas,
+                "hash_conteudo":
+                    h_conteudo,
+                "status":
+                    status,
+                "detalhes":
+                    detalhe,
+                "dt_leitura":
+                    pd.Timestamp.now(),
+                "colunas_json":json.dumps(cabecalho,ensure_ascii=False),
+      
+            }
+        )
+    append_registros(
+    registros_controle,
+    ARQ_CONTROLE)
+    append_registros(
+    
+    registro_execucao,
+    ARQ_EXECUCAO)
+    print(
+        f"{len(registros_controle)} abas processadas"
+    )
+
+
+if __name__ == "__main__":
+    main()

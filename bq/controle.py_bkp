@@ -1,0 +1,42 @@
+
+
+from google.cloud import bigquery
+
+
+def obter_ultimo_registro(
+    client,
+    project,
+    dataset,
+    tabela,
+    gid
+):
+
+    sql = f"""
+    SELECT *
+    FROM `{project}.{dataset}.{tabela}`
+    WHERE gid = @gid
+    ORDER BY dt_leitura DESC
+    LIMIT 1
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(
+                "gid",
+                "STRING",
+                gid
+            )
+        ]
+    )
+
+    rows = list(
+        client.query(
+            sql,
+            job_config=job_config
+        )
+    )
+
+    if rows:
+        return dict(rows[0])
+
+    return None

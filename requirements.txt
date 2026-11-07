@@ -1,0 +1,26 @@
+# DataFrame
+pandas>=2.2.0
+
+# Google Sheets
+gspread>=6.0.0
+
+# Autenticação Google
+google-auth>=2.35.0
+
+# API Drive (modifiedTime)
+google-api-python-client>=2.150.0
+
+# BigQuery (quando voltar a usar)
+google-cloud-bigquery>=3.29.0
+
+# Upload DataFrame -> BigQuery
+pandas-gbq>=0.27.0
+
+# Escrita de parquet (opcional futuro)
+pyarrow>=18.0.0
+
+# Datas
+python-dateutil>=2.9.0
+
+#Google Cloud Storage
+google-cloud-storage>=3.1.0
