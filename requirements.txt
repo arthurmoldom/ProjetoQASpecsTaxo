@@ -2,10 +2,12 @@
 pandas>=2.2.0
 
 # Google Sheets
-gspread>=6.0.0
+gspread>=6.1.4
 
 # Autenticação Google
 google-auth>=2.35.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
 
 # API Drive (modifiedTime)
 google-api-python-client>=2.150.0
@@ -24,3 +26,5 @@ python-dateutil>=2.9.0
 
 #Google Cloud Storage
 google-cloud-storage>=3.1.0
+
+openpyxl>=3.1.5
