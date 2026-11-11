@@ -43,3 +43,9 @@ ARQ_EXECUCAO = (
     "tmp/controle/"
     "monitoramento_sheet_ControleExec_RegistroDePlanosESPECsAtivos.csv"
 )
+
+# Tabela acessória: guarda o último SHA256 de cada (arquivo, aba) já enviado à bronze
+TB_SHA = (f"{PROJECT_ID}.{DATASET}.bronze_qa_taxo_sha")
+
+# Tipos de layout reconhecidos
+TIPOS_VALIDOS = ("SPEC", "PLANO")

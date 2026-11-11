@@ -5,6 +5,7 @@ from google.auth import impersonated_credentials
 TARGET_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",  # necessário p/ files.get_media (baixar .xlsx)
     "https://www.googleapis.com/auth/bigquery",
     "https://www.googleapis.com/auth/devstorage.full_control"
 ]

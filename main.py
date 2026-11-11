@@ -4,80 +4,87 @@ import pandas                   as pd
 import os
 import json
 ### Do Projeto
-from config                     import (SPREADSHEET_ID,ARQ_CONTROLE,CSV_FOLDER,GCS_PREFIX,GCS_BUCKET, TB_MONITORAMENTO,TB_BRONZE,PROJECT_ID,TB_CADASTRO)
+from config                     import (SPREADSHEET_ID,ARQ_CONTROLE,CSV_FOLDER,GCS_PREFIX,GCS_BUCKET,
+                                        TB_MONITORAMENTO,TB_BRONZE,PROJECT_ID,TB_CADASTRO,TB_SHA,TIPOS_VALIDOS)
 from auth.auth                  import get_credentials
-from sheets.leitura             import ( abrir_planilha,ler_aba,ler_aba_excel,ler_aba_raw,ler_excel_raw)
+from sheets.leitura             import (abrir_planilha,ler_aba)
 from storage.controle_csv       import (append_registros)
 from utils.sanitizacao          import (higienizar_dataframe,normalizar_colunas,sanitizar_nome_arquivo)
+from utils.hash_utils           import (sha256_dataframe)
 from storage.gcs                import (upload_csv_para_gcs)
 from sheets.filetype            import (obter_info_arquivo)
 from sheets.excel               import (baixar_excel)
-from sheets.header_locator      import (localizar_header,aplicar_header)
+from sheets.header_locator      import (aplicar_header)
+from sheets.abas                import (aparar_raw,detectar_header,iterar_abas_gsheet,iterar_abas_excel)
 from bq.carga                   import (carregar_dataframe)
+from bq.sha_controle            import (garantir_tabela_sha,carregar_ultimos_shas)
 from export.export_csv          import (exportar_csv)
 
+MIME_GSHEET = "application/vnd.google-apps.spreadsheet"
+MIME_XLSX   = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-def localizar_gid(planilha, gid):
+# Carimbo ÚNICO da execução. É ele que vira "dt_carga" na bronze e "dt_ingestao" na tabela de SHA,
+# e é a base do rótulo "YYYY-MM-DD HH:mm P - Aba" da silver (todas as abas da mesma execução
+# precisam ter o mesmo timestamp, senão o desempate A/B/C não funciona).
+DT_EXECUCAO = datetime.now(timezone.utc)
 
-    for worksheet in planilha.worksheets():
 
-        if str(worksheet.id) == str(gid):
-            return worksheet
-
-    return None
-
+def novo_controle(**kw):
+    base = {"dt_leitura"    : DT_EXECUCAO,
+            "aba_cadastro"  : "",
+            "campanha"      : "",
+            "tipo"          : "",
+            "spreadsheet_id": "",
+            "gid"           : "",
+            "aba_esperada"  : "",
+            "aba_encontrada": "",
+            "status"        : "OK",
+            "detalhes"      : "",
+            "arquivo_csv"   : "",
+            "mime_type"     : ""}
+    base.update(kw)
+    return base
 
 
 def main():
 
     creds = get_credentials()
-    print(type(creds))
-
-    if hasattr(creds, "service_account_email"):
-        print("SA:", creds.service_account_email)
-    else:
-        print("Sem atributo service_account_email")
 
     print("Abrindo planilha mestre...")
+    planilha_mestre = abrir_planilha(SPREADSHEET_ID, creds)
 
-    planilha_mestre = abrir_planilha(
-        SPREADSHEET_ID,
-        creds
-    )
+    print("Carregando últimos SHA256 já enviados à bronze...")
+    garantir_tabela_sha(creds, PROJECT_ID, TB_SHA)
+    shas_anteriores = carregar_ultimos_shas(creds, PROJECT_ID, TB_SHA)
+    print(f"  {len(shas_anteriores)} abas com SHA conhecido")
 
     registros_controle  = []
     registros_bronze    = []
+    registros_sha       = []
     cadastros_bq        = []
+    arquivos_vistos     = set()   # (spreadsheet_id, tipo) -> cada ARQUIVO é lido uma vez só
+
     for aba_cadastro in planilha_mestre.worksheets():
 
         nome_aba_cadastro = aba_cadastro.title
-
-        print(            f"Aba:{nome_aba_cadastro}, gid:{aba_cadastro.id}"        )
+        print(f"Aba:{nome_aba_cadastro}, gid:{aba_cadastro.id}")
 
         # ignora aba de formulário
         if nome_aba_cadastro.lower() == "form":
             continue
 
         try:
-
-            df_cadastro = ler_aba(                aba_cadastro            )
-            #print(df_cadastro.dtypes)
-            #print(df_cadastro)
-            #break
-
+            df_cadastro = ler_aba(aba_cadastro)
         except Exception as e:
-
-            print(                f"Erro lendo cadastro {nome_aba_cadastro}: {e}"            )
-
+            print(f"Erro lendo cadastro {nome_aba_cadastro}: {e}")
             continue
 
         if df_cadastro.empty:
-
-            print(                f"{nome_aba_cadastro} sem registros."            )
-
+            print(f"{nome_aba_cadastro} sem registros.")
             continue
+
         df_cadastro_bq = df_cadastro.copy()
-        df_cadastro_bq["dt_carga"] = (    datetime.now(timezone.utc))
+        df_cadastro_bq["dt_carga"] = DT_EXECUCAO
         df_cadastro_bq = df_cadastro_bq.rename(columns={
                             "ID"            : "id",
                             "Timestamp"     : "timestamp_cadastro",
@@ -94,267 +101,195 @@ def main():
 
         df_cadastro = df_cadastro[
                         df_cadastro["Ativa"].astype(str).str.lower().isin(
-                            [
-                                "true",
-                                "1",
-                                "sim",
-                                "yes",
-                                "verdadeiro"
-                            ]
+                            ["true", "1", "sim", "yes", "verdadeiro"]
                         )
-                    ]   
-#        print(df_cadastro)
-        
-        
+                    ]
+
         for _, row in df_cadastro.iterrows():
-            
-            
 
-            spreadsheet_id          = str(row.get("ID da planilha", "")).strip()
-            gid                     = str(row.get("Gid", "") ).strip()
-            aba_esperada            = str(row.get("Aba", "")).strip()
-            campanha                = str(row.get("Campanha", "")).strip()
-            tipo                    = str(row.get("Tipo", "")).strip()
-            status = "OK"
-            detalhe = ""
-            aba_encontrada = ""
-            arquivo_csv = None
+            spreadsheet_id  = str(row.get("ID da planilha", "")).strip()
+            aba_esperada    = str(row.get("Aba", "")).strip()
+            campanha        = str(row.get("Campanha", "")).strip()
+            tipo            = str(row.get("Tipo", "")).strip()
+            ctx = dict(aba_cadastro=nome_aba_cadastro, campanha=campanha, tipo=tipo,
+                       spreadsheet_id=spreadsheet_id, aba_esperada=aba_esperada)
 
-            
             if spreadsheet_id == "":
+                registros_controle.append(novo_controle(**ctx, status="ERRO", detalhes="ID da planilha vazio"))
+                continue
 
-                status = "ERRO"
-                detalhe = "ID da planilha vazio"
+            if tipo.upper() not in TIPOS_VALIDOS:
+                registros_controle.append(novo_controle(**ctx, status="ERRO",
+                                          detalhes=f"Tipo inválido '{tipo}' (esperado: {TIPOS_VALIDOS})"))
+                continue
 
-            else:
+            # várias linhas do cadastro podem apontar para o mesmo arquivo (uma por aba).
+            # Como agora varremos TODAS as abas, o arquivo só precisa ser lido uma vez.
+            chave_arquivo = (spreadsheet_id, tipo.upper())
+            if chave_arquivo in arquivos_vistos:
+                registros_controle.append(novo_controle(**ctx, status="INFO",
+                                          detalhes="Arquivo já processado nesta execução (outra linha do cadastro)"))
+                continue
+            arquivos_vistos.add(chave_arquivo)
+
+            # ---------- 1) Descobre o tipo do arquivo e obtém um iterador de abas ----------
+            try:
+                info_arquivo = obter_info_arquivo(spreadsheet_id, creds)
+                mime_type = info_arquivo["mimeType"]
+                ctx["mime_type"] = mime_type
+
+                if mime_type == MIME_GSHEET:
+                    abas = iterar_abas_gsheet(abrir_planilha(spreadsheet_id, creds))
+
+                elif mime_type == MIME_XLSX:
+                    os.makedirs("tmp/xlsx", exist_ok=True)
+                    caminho_excel = f"tmp/xlsx/{spreadsheet_id}.xlsx"
+                    baixar_excel(spreadsheet_id, caminho_excel, creds)
+                    abas = iterar_abas_excel(caminho_excel)
+
+                else:
+                    registros_controle.append(novo_controle(**ctx, status="ERRO",
+                                              detalhes=f"Formato de arquivo não suportado: {mime_type}"))
+                    continue
+
+            except Exception as e:
+                # erro ao abrir/baixar o arquivo: registra e segue para o próximo (NÃO derruba a execução)
+                registros_controle.append(novo_controle(**ctx, status="ERRO",
+                                          detalhes=f"Falha ao abrir/baixar arquivo: {e}"))
+                continue
+
+            # ---------- 2) Passa por TODAS as abas ----------
+            for nome_aba, gid, df_raw, erro_leitura in abas:
+
+                ctx_aba = dict(ctx, gid=gid, aba_encontrada=nome_aba)
+
+                if erro_leitura is not None:
+                    registros_controle.append(novo_controle(**ctx_aba, status="ERRO",
+                                              detalhes=f"Falha lendo aba: {erro_leitura}"))
+                    continue
 
                 try:
-                    info_arquivo = obter_info_arquivo(spreadsheet_id,creds)
-                    mime_type = (info_arquivo["mimeType"])
-                    if (mime_type == "application/vnd.google-apps.spreadsheet"):
-                        planilha_destino = abrir_planilha(spreadsheet_id,creds)
-                        worksheet = localizar_gid(planilha_destino,gid)
-                        if worksheet is None:
-                            status = "ERRO"
-                            detalhe = ("GID não encontrado")
-                        else:
-                            aba_encontrada = (worksheet.title)
-                            df_raw = ler_aba_raw(worksheet)
-                            linha_header = localizar_header(df_raw,tipo)
-                            df_conteudo = aplicar_header(df_raw,linha_header,tipo)
+                    df_raw = aparar_raw(df_raw)
+                    linha_header = detectar_header(df_raw, tipo)
 
-                    elif (mime_type =="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
-                        status = "INFO"
-                        detalhe = ("Arquivo Excel processado")
-                        caminho_excel = (f"tmp/xlsx/{spreadsheet_id}.xlsx")
-                        os.makedirs("tmp/xlsx",exist_ok=True)
-                        try:
-                            baixar_excel(spreadsheet_id,caminho_excel,creds)             
-                        except Exception as e:
-                            status = "ERRO"
-                            detalhe = (f"Falha download Excel: "f"{str(e)}")
-                            registros_controle.append(
-                                {"dt_leitura"       :datetime.now(timezone.utc),
-                                "aba_cadastro"      :nome_aba_cadastro,
-                                "campanha"          :campanha,
-                                "tipo"              :tipo,
-                                "spreadsheet_id"    :spreadsheet_id,
-                                "gid"               :gid,
-                                "aba_esperada"      :aba_esperada,
-                                "aba_encontrada"    :"",
-                                "status"            :status,
-                                "detalhes"          :detalhe,
-                                "arquivo_csv"       :"",
-                                "mime_type"         :mime_type
-                                }
-                            )
-
-                            continue
-
-                        aba_encontrada = (aba_esperada)
-                        abas_excel = listar_abas_excel(caminho_excel)
-                        if aba_esperada not in abas_excel:
-                            status = "ERRO"
-                            detalhe = (f"Aba não encontrada no Excel: "f"{aba_esperada}")
-                            continue
-                        
-                        df_raw = ler_excel_raw(caminho_excel,aba_esperada)
-                        linha_header = localizar_header(df_raw,tipo)
-                        df_conteudo = aplicar_header(df_raw,linha_header)
-
-                    else:
-                        status = "ERRO"
-                        detalhe = (f"Formato de arquivo não suportado: "f"{mime_type}")
+                    # aba que não segue o layout mínimo -> ignorada
+                    if linha_header is None:
+                        registros_controle.append(novo_controle(**ctx_aba, status="IGNORADA",
+                                                  detalhes=f"Layout {tipo.upper()} não reconhecido"))
                         continue
-                    
-                    nome_aba_real = aba_encontrada
-                    
 
+                    df_conteudo = aplicar_header(df_raw, linha_header, tipo)
                     df_conteudo = higienizar_dataframe(df_conteudo)
                     df_conteudo = normalizar_colunas(df_conteudo)
-                    idx = linha_header+1 ##pandas conta de 0
-                    for _, linha in df_conteudo.iterrows():
-                        
-                        registros_bronze.append(
-                                {
-                                    "dt_carga" : datetime.now(timezone.utc),
-                                    "campanha" : campanha,
-                                    "tipo" : tipo,
-                                    "spreadsheet_id": spreadsheet_id,
-                                    "gid" : gid,
-                                    "aba" : nome_aba_real,
-                                    "payload_json" : json.dumps(    linha.to_dict(),    ensure_ascii=False),
-                                    "source_row": idx + 1,
-                                    "header_row":linha_header
-                                }
-                            )
-                        idx += 1
 
-#                    print(f"{nome_aba_real}: "f"{len(df_conteudo)} linhas")
+                    # remove linhas totalmente vazias (mantém o índice p/ calcular source_row)
+                    df_conteudo = df_conteudo[(df_conteudo.fillna("") != "").any(axis=1)]
 
-                    nome_aba = f"{campanha}_{tipo}_{gid}"
-                    nome_aba = sanitizar_nome_arquivo(nome_aba )
+                    if df_conteudo.empty:
+                        registros_controle.append(novo_controle(**ctx_aba, status="IGNORADA",
+                                                  detalhes="Layout ok, mas sem linhas de dados"))
+                        continue
 
-                    nome_sheet = str(nome_aba_real)
-                    nome_sheet = sanitizar_nome_arquivo(nome_sheet)
-                                
-#                    print(f"ANTES EXPORT {nome_aba}")
-#                    print("CSV_FOLDER =", CSV_FOLDER)
-#                    print("worksheet.title =", repr(nome_sheet))
-#                    print("nome_aba =", repr(nome_aba))
-                    arquivo_csv = exportar_csv(
-                    df=df_conteudo,
-                    pasta=CSV_FOLDER,
-                    gid=nome_aba,
-                    nome_aba=nome_sheet
-                    )
-                    print(f"DEPOIS EXPORT {nome_aba}")
-                    if (
-                        aba_encontrada
-                        !=
-                        aba_esperada
-                    ):
+                    # ---------- 3) SHA256 x último SHA conhecido ----------
+                    sha = sha256_dataframe(df_conteudo)
+                    sha_anterior = shas_anteriores.get((spreadsheet_id, nome_aba))
 
-                        status = "ALERTA"
-                        detalhe = (
-                            "Aba renomeada"
-                        )
+                    if sha == sha_anterior:
+                        registros_controle.append(novo_controle(**ctx_aba, status="SEM_ALTERACAO",
+                                                  detalhes=f"sha256={sha}"))
+                        continue
 
-                    data_ref = datetime.now(timezone.utc).strftime("%Y%m%d" )
+                    detalhe = "ABA NOVA" if sha_anterior is None else "ABA ALTERADA"
 
-#                    print(f'{data_ref} Enviar para GCS')
-                    blob_name = (
-                        f"{GCS_PREFIX}/raw/"
-                        f"dt={data_ref}/"
-                        f"{nome_aba}/"
-                        f"{nome_sheet}.csv"
-                    )
-#                    print("nome_aba =", repr(nome_aba))
-#                    print("worksheet.title =", repr(nome_aba_real))
-#                    print("nome_sheet =", repr(nome_sheet))
-#                    print(f"{GCS_PREFIX}")
-                    gcs_uri = upload_csv_para_gcs(
-                        credentials=creds,
-                        bucket_name=GCS_BUCKET,
-                        arquivo_local=arquivo_csv,
-                        blob_name=blob_name
-                    )
+                    # ---------- 4) Mudou -> bronze + CSV + GCS ----------
+                    for i, (_, linha) in enumerate(df_conteudo.iterrows()):
+                        registros_bronze.append({
+                            "dt_carga"      : DT_EXECUCAO,
+                            "campanha"      : campanha,
+                            "tipo"          : tipo,
+                            "spreadsheet_id": spreadsheet_id,
+                            "gid"           : gid,
+                            "aba"           : nome_aba,
+                            "payload_json"  : json.dumps(linha.to_dict(), ensure_ascii=False),
+                            # índice do df_conteudo = posição da linha após o header (0,1,2...)
+                            "source_row"    : int(df_conteudo.index[i]) + int(linha_header) + 2,
+                            "header_row"    : int(linha_header),
+                            "sha256"        : sha,
+                        })
 
-                    print(
-                        f"Enviado para {gcs_uri}"
-                    )
+                    registros_sha.append({
+                        "dt_ingestao"   : DT_EXECUCAO,
+                        "campanha"      : campanha,
+                        "tipo"          : tipo,
+                        "spreadsheet_id": spreadsheet_id,
+                        "gid"           : gid,
+                        "aba"           : nome_aba,
+                        "sha256"        : sha,
+                        "qtd_linhas"    : int(len(df_conteudo)),
+                        "header_row"    : int(linha_header),
+                        "mime_type"     : mime_type,
+                    })
+
+                    nome_arq = sanitizar_nome_arquivo(f"{campanha}_{tipo}_{spreadsheet_id}")
+                    nome_sheet = sanitizar_nome_arquivo(nome_aba)
+                    arquivo_csv = exportar_csv(df=df_conteudo, pasta=CSV_FOLDER,
+                                               gid=nome_arq, nome_aba=nome_sheet)
+
+                    blob_name = (f"{GCS_PREFIX}/raw/"
+                                 f"dt={DT_EXECUCAO.strftime('%Y%m%d')}/"
+                                 f"{nome_arq}/"
+                                 f"{nome_sheet}_{sha[:8]}.csv")   # sha no nome: 2 execuções no dia não se sobrescrevem
+                    gcs_uri = upload_csv_para_gcs(credentials=creds, bucket_name=GCS_BUCKET,
+                                                  arquivo_local=arquivo_csv, blob_name=blob_name)
+                    print(f"[{detalhe}] {nome_aba} -> {gcs_uri}")
+
+                    registros_controle.append(novo_controle(**ctx_aba, status="ATUALIZADA",
+                                              detalhes=f"{detalhe}; sha256={sha}; linhas={len(df_conteudo)}",
+                                              arquivo_csv=arquivo_csv))
 
                 except Exception as e:
-                    print("\nERRO REAL:")
-                    print(type(e))
-                    print(str(e))
-
-                    raise
-            registros_controle.append(
-                {"dt_leitura"    :datetime.now(timezone.utc),
-                 "aba_cadastro"  :nome_aba_cadastro,
-                 "campanha"      :campanha,
-                 "tipo"          :tipo,
-                 "spreadsheet_id":spreadsheet_id,
-                 "gid"           :str(gid),
-                 "aba_esperada"  :aba_esperada,
-                 "aba_encontrada":aba_encontrada,
-                 "status"        :status,
-                 "detalhes"      :detalhe, 
-                 "arquivo_csv"   :arquivo_csv,
-                 "mime_type"     :mime_type
-                }
-            )
+                    # erro numa aba não derruba as demais
+                    print(f"ERRO na aba '{nome_aba}' ({spreadsheet_id}): {type(e).__name__}: {e}")
+                    registros_controle.append(novo_controle(**ctx_aba, status="ERRO",
+                                              detalhes=f"{type(e).__name__}: {e}"))
 
     append_registros(registros_controle, ARQ_CONTROLE)
-    
+
+    # ---------- 5) Cargas no BigQuery ----------
+    # Sem try/except engolindo erro: se a bronze falhar o job deve falhar (e a tabela de SHA NÃO é gravada,
+    # senão a aba ficaria marcada como "já enviada" sem estar na bronze).
     try:
-        data_ref = datetime.now(timezone.utc).strftime("%Y%m%d")
-        
-        
-        
-        blob_monitoramento = (f"{GCS_PREFIX}/monitoramento/"
-                            f"dt={data_ref}/"
-                            f"{os.path.basename(ARQ_CONTROLE)}"
-                            )
-        
-        
-#        print("Enviando monitoramento para storage")
-
-
-        gcs_monitoramento = upload_csv_para_gcs(
-                                credentials=creds,
-                                bucket_name=GCS_BUCKET,
-                                arquivo_local=ARQ_CONTROLE,
-                                blob_name=blob_monitoramento)
-#        print(f"Monitoramento enviado: "f"{gcs_monitoramento}")
-#        print(f"{len(registros_controle)} registros processados")
-        df_monitoramento = pd.read_csv(ARQ_CONTROLE,    sep=";")
-        df_monitoramento["dt_leitura"] = pd.to_datetime(    df_monitoramento["dt_leitura"],    utc=True,    errors="coerce")
-        df_monitoramento["gid"] = (    df_monitoramento["gid"]    .fillna("")    .astype(str))
-
-
-        df_bronze = pd.DataFrame(registros_bronze)
-        df_bronze["gid"] = (    df_bronze["gid"]    .fillna("")    .astype(str))
-
-#        print(f"Bronze: {df_bronze.shape}")
-#        print(df_bronze.head(1))
-#        print(type(df_bronze.iloc[0]["payload_json"]))
-        df_cadastro_final = pd.concat(cadastros_bq,ignore_index=True)
-#        print(f"Cadastro: {df_cadastro_final.shape}")
-        print("------tipos----------")
-        print(df_bronze.dtypes)
-        print(df_monitoramento.dtypes)
-        print(df_cadastro_final.dtypes)
-        print("------tipos----------")
-        print(f"Salvando no BigQuery")
-        carregar_dataframe(
-            df=df_cadastro_final,
-            tabela=TB_CADASTRO,
-            creds=creds,
-            project_id=PROJECT_ID
-        )
-        carregar_dataframe(
-                df=df_monitoramento,
-                tabela=TB_MONITORAMENTO,    
-                creds=creds,
-                project_id=PROJECT_ID
-        )
-
-        carregar_dataframe(
-            df=df_bronze,
-            tabela=TB_BRONZE,
-            creds=creds,
-            project_id=PROJECT_ID
-            )
-
-       
-        if os.path.exists(ARQ_CONTROLE):
-            os.remove(ARQ_CONTROLE)
-
+        data_ref = DT_EXECUCAO.strftime("%Y%m%d")
+        upload_csv_para_gcs(credentials=creds, bucket_name=GCS_BUCKET, arquivo_local=ARQ_CONTROLE,
+                            blob_name=f"{GCS_PREFIX}/monitoramento/dt={data_ref}/{os.path.basename(ARQ_CONTROLE)}")
     except Exception as e:
-        print(      f"Falha upload monitoramento: "
-                    f"{str(e)}"    )
+        print(f"Falha upload monitoramento p/ GCS: {e}")
+
+    # 5.1 bronze primeiro...
+    if registros_bronze:
+        df_bronze = pd.DataFrame(registros_bronze)
+        df_bronze["gid"] = df_bronze["gid"].fillna("").astype(str)
+        print(f"Bronze: {df_bronze.shape}")
+        carregar_dataframe(df=df_bronze, tabela=TB_BRONZE, creds=creds, project_id=PROJECT_ID)
+
+        # 5.2 ...depois os SHAs (só quem realmente subiu)
+        carregar_dataframe(df=pd.DataFrame(registros_sha), tabela=TB_SHA, creds=creds, project_id=PROJECT_ID)
+    else:
+        print("Nenhuma aba nova/alterada. Bronze não atualizada.")
+
+    # 5.3 cadastro e monitoramento
+    if cadastros_bq:
+        carregar_dataframe(df=pd.concat(cadastros_bq, ignore_index=True), tabela=TB_CADASTRO,
+                           creds=creds, project_id=PROJECT_ID)
+
+    df_monitoramento = pd.read_csv(ARQ_CONTROLE, sep=";", dtype=str)
+    df_monitoramento["dt_leitura"] = pd.to_datetime(df_monitoramento["dt_leitura"], utc=True, errors="coerce")
+    df_monitoramento["gid"] = df_monitoramento["gid"].fillna("").astype(str)
+    carregar_dataframe(df=df_monitoramento, tabela=TB_MONITORAMENTO, creds=creds, project_id=PROJECT_ID)
+
+    if os.path.exists(ARQ_CONTROLE):
+        os.remove(ARQ_CONTROLE)
+
 
 if __name__ == "__main__":
     main()
