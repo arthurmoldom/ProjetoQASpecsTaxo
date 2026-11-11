@@ -38,7 +38,7 @@ Requer credenciais ADC com permissão para impersonar a SA definida em `auth/aut
 - **Cota do Google Sheets:** ler todas as abas consome leituras (60 por minuto). Há retry em 429, mas arquivos com muitas abas aumentam o tempo de execução.
 - **Novas colunas na bronze.** O `carregar_dataframe` usa `WRITE_APPEND`, então qualquer coluna nova exige `ALTER TABLE ... ADD COLUMN` antes, ou `schema_update_options` na carga.
 - **Silver.** A bronze acumula **versões** de cada aba. As procs precisam decidir entre última versão (`ultima_versao`) ou histórico. A chave da versão é `(spreadsheet_id, aba, dt_carga)`, não o SHA, porque um SHA pode voltar (A→B→A). O fuso do rótulo é `America/Sao_Paulo`. Se a proc montar SQL com `FORMAT()`, escape os `%` como `%%`.
-- **Carga inicial.** Linhas antigas da bronze (`sha256 IS NULL`) serão reingeridas na primeira execução. Apague-as antes para não duplicar a silver->verifique na tabela sql as procedures e views
+- **Carga inicial.** Linhas antigas da bronze (`sha256 IS NULL`) serão reingeridas na primeira execução. Apague-as antes para não duplicar a silver->verifique na tabela sql as procedures e views  
 - **Credenciais.** Não versione `creds/service-account.json`. O `auth.py` usa ADC com impersonação de service account.
 - **GCS.** O nome do CSV inclui `sha[:8]`, então várias versões no mesmo dia não se sobrescrevem: `QA_Taxo/raw/dt=YYYYMMDD/<campanha_tipo_id>/<aba>_<sha8>.csv`.
 
